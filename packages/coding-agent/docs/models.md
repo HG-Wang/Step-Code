@@ -2,6 +2,11 @@
 
 Add custom providers and models (Ollama, vLLM, LM Studio, proxies) via `~/.stepcode/agent/models.json`.
 
+> Step product users can equivalently declare custom providers under
+> `[providers.<id>]` in the global `~/.stepcode/config.toml` instead of editing
+> `models.json` by hand — see [Step configuration files](../../../docs/step-configuration.md#custom-model-providers).
+> The `models.json` format below remains fully supported for both product and SDK hosts.
+
 ## Table of Contents
 
 - [Minimal Example](#minimal-example)

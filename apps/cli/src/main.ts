@@ -13,8 +13,8 @@ import {
 	applyStepCodeConfigDefaults,
 	buildStepSystemPromptAppendix,
 	configureHttpDispatcher,
+	createProviderRegistrationsInlineExtension,
 	createStepCode,
-	createStepCodeProviderInlineExtension,
 	createStepProviderConfig,
 	createStepSessionManagerFactory,
 	createStepSettingsManager,
@@ -46,6 +46,7 @@ import {
 	readFeedbackUsername,
 	readGlobalStepConfig,
 	readOrCreateStepDeviceId,
+	readStepConfigProviderRegistrations,
 	readStoredCredential,
 	resolveStepAgentDir,
 	resolveStepConfigDir,
@@ -62,6 +63,7 @@ import {
 	STEP_DEFAULT_PROVIDER,
 	STEP_PROVIDER_ID,
 	STEPCODE_VERSION,
+	type StepCodeProviderRegistration,
 	type StepSettingsManager,
 	setStderrDevLogStorageRootDirectory,
 	stopThemeWatcher,
@@ -102,7 +104,24 @@ const sdkStdio = sdkStdioRequested();
 // constructed below, so a user's saved `telemetry.enabled = false` has to be
 // visible here or reporting silently turns itself back on at every launch.
 const { persistedDefaults: stepPersistedDefaults, stepCodeConfig } = await loadStepStartupConfig();
-const stepCodeProviderExtension = stepCodeConfig ? createStepCodeProviderInlineExtension(stepCodeConfig) : undefined;
+// Custom providers come from two sources: `[providers.<id>]` in the global
+// `config.toml` (user-authored) and providers injected via STEPCODE_CONFIG_PATH.
+// The injected config wins on an id clash so managed deployments keep authority.
+const { providers: configTomlProviders, error: configTomlProvidersError } = readStepConfigProviderRegistrations();
+if (configTomlProvidersError) {
+	// Non-fatal: a malformed provider block must not stop the session from starting.
+	process.stderr.write(`${configTomlProvidersError}\n`);
+}
+const mergedCustomProviders = new Map<string, StepCodeProviderRegistration>();
+for (const provider of configTomlProviders) mergedCustomProviders.set(provider.id, provider);
+for (const provider of stepCodeConfig?.providers ?? []) mergedCustomProviders.set(provider.id, provider);
+const customProviderRegistrations = [...mergedCustomProviders.values()];
+const customProviderExtension =
+	customProviderRegistrations.length > 0
+		? createProviderRegistrationsInlineExtension(customProviderRegistrations, "Step custom providers")
+		: undefined;
+const effectiveDefaultProvider =
+	stepCodeConfig?.defaultProvider ?? stepPersistedDefaults.provider ?? STEP_DEFAULT_PROVIDER;
 // Parse only the product policy flags here so the inline extension can receive
 // explicit CLI values before Pi builds its resource loader. `main()` parses the
 // same argv again for normal diagnostics and all other session options.
@@ -190,18 +209,18 @@ const stepMainOptions: MainOptions = {
 			toolOverrides: stepPermissionArgs.toolOverride ?? stepPermissionArgs.toolOverrides,
 		},
 		traceHeaderPolicy: observability.traceHeaderPolicy(),
-		stepCodeProviderExtension,
+		customProviderExtension,
 	}),
 	authRuntimeSetup: (modelRuntime) => {
 		modelRuntime.registerProvider(STEP_PROVIDER_ID, createStepProviderConfig());
-		for (const provider of stepCodeConfig?.providers ?? []) {
+		for (const provider of customProviderRegistrations) {
 			modelRuntime.registerProvider(provider.id, provider.config);
 		}
 	},
-	allowedAuthProviders: [STEP_PROVIDER_ID, ...(stepCodeConfig?.providers.map((provider) => provider.id) ?? [])],
+	allowedAuthProviders: [STEP_PROVIDER_ID, ...customProviderRegistrations.map((provider) => provider.id)],
 	disableBackgroundServices: isStepServicesDisabled(),
 	defaultTheme: getStepDefaultTheme(),
-	defaultProvider: stepCodeConfig?.defaultProvider ?? stepPersistedDefaults.provider ?? STEP_DEFAULT_PROVIDER,
+	defaultProvider: effectiveDefaultProvider,
 	defaultModel: stepCodeConfig?.defaultModel ?? stepPersistedDefaults.model ?? STEP_DEFAULT_MODEL,
 	runtimeHostFactory: createStepCode,
 	stdioModeFactory: sdkStdio ? createSdkStdioMode({ writeFrame: rawStdoutWrite }) : undefined,
@@ -209,7 +228,7 @@ const stepMainOptions: MainOptions = {
 		showChangelog: false,
 		tuiStyle: "step" as const,
 		defaultModelForProvider: (providerId) => (providerId === STEP_PROVIDER_ID ? STEP_DEFAULT_MODEL : undefined),
-		allowedAuthProviders: [STEP_PROVIDER_ID],
+		allowedAuthProviders: [STEP_PROVIDER_ID, ...customProviderRegistrations.map((provider) => provider.id)],
 		stepLogin: (host) =>
 			runStepLogin({
 				authPath: getStepAuthPath(),
@@ -560,6 +579,7 @@ try {
 					args: parsedInteractiveArgs,
 				});
 				if (
+					effectiveDefaultProvider === STEP_PROVIDER_ID &&
 					!hasConfiguredStepCodeCredential(stepCodeConfig) &&
 					needsStepLoginBeforeInteractive({
 						authPath: getStepAuthPath(),

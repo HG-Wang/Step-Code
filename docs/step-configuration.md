@@ -59,6 +59,70 @@ Step screens pass the Step agent directory; generic TUI callers default to the
 system temporary directory. Rendering equivalence tests select the uncached
 renderer through a test-process argument.
 
+## Custom model providers
+
+Beyond the built-in Step provider you can register custom OpenAI-compatible
+endpoints (Ollama, vLLM, LM Studio, SGLang, one-api, LiteLLM, and any proxy that
+speaks the OpenAI Chat Completions or Responses API) directly in the global
+`~/.stepcode/config.toml`. Add one `[providers.<id>]` table per provider. The
+`<id>` is the provider name you use with `--provider` and that appears in
+`/model`, `/login`, and `step auth`.
+
+```toml
+# Optional: make a custom provider the startup default.
+# defaultProvider = "ollama"
+# defaultModel   = "qwen2.5-coder:7b"
+
+[providers.ollama]
+name    = "Ollama (local)"
+api     = "openai-completions"        # openai-completions | openai-responses | anthropic-messages
+baseUrl = "http://localhost:11434/v1"
+apiKey  = "ollama"                    # literal | $ENV | ${ENV} | !command; omit to use /login
+# authHeader = true                   # send "Authorization: Bearer <apiKey>" automatically
+# headers = { "X-Custom" = "value" }
+compat = { supportsDeveloperRole = false, supportsReasoningEffort = false }
+
+[[providers.ollama.models]]
+id            = "qwen2.5-coder:7b"    # wire model id sent to the API
+name          = "Qwen2.5 Coder 7B"
+reasoning     = false
+input         = ["text"]              # or ["text", "image"]
+contextWindow = 131072
+maxTokens     = 8192
+# cost = { input = 0, output = 0, cacheRead = 0, cacheWrite = 0 }
+```
+
+`api` also accepts the aliases `openai-compatible`, `chat`, `completions`,
+`responses`, `anthropic`, and `claude-messages`. Set it at the provider level
+(default for every model) or per model. `apiKey`, `headers`, and model
+`compat` follow the same value-resolution rules as `models.json`: a leading
+`$ENV`/`${ENV}` interpolates the environment, a leading `!command` runs a
+command and uses its stdout, `$$`/`$!` are literal escapes, and anything else
+is a literal. Omit `apiKey` to authenticate through `/login` or `--api-key`
+instead of storing a value.
+
+`compat` tunes a partially OpenAI-compatible server. Provider-level `compat`
+applies to every model; a model-level `compat` overrides it per key. The most
+common flags:
+
+| Field | Description |
+|-------|-------------|
+| `supportsDeveloperRole` | Send the system prompt as `system` instead of `developer` (many local servers reject `developer`). |
+| `supportsReasoningEffort` | Send `reasoning_effort`. Disable on servers that reject it. |
+| `supportsUsageInStreaming` | Send `stream_options.include_usage`. Default `true`. |
+| `maxTokensField` | `max_completion_tokens` or `max_tokens`. |
+| `supportsFinishReason` | Whether streams carry `finish_reason`. Default `true`. |
+| `requiresToolResultName` | Include `name` on tool-result messages. |
+| `thinkingFormat` | `openai`, `openrouter`, `deepseek`, `together`, `baseten`, `zai`, `qwen`, `chat-template`, `qwen-chat-template`, `string-thinking`, or `ant-ling`. |
+
+These providers load at launch and appear alongside the Step provider. If no
+custom provider matches the startup default, the built-in Step provider remains
+the default. A malformed `[providers.<id>]` block is reported as a non-fatal
+warning instead of blocking startup.
+
+The same providers are available to `step auth` and `/login`, so an API key can
+be entered interactively when it is not set inline.
+
 ## First-run theme prompt
 
 The first interactive launch asks which theme reads best in the terminal, after

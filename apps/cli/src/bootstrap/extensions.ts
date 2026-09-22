@@ -28,8 +28,8 @@ export interface StepExtensionFactoryDeps {
 	feedbackIdentity: StepExtensionOptions["feedbackIdentity"];
 	/** Initial Step permission policy parsed from CLI/runtime options. */
 	permission: StepExtensionOptions["permission"];
-	/** Optional StepCode provider extension, present only when configured. */
-	stepCodeProviderExtension: InlineExtension | undefined;
+	/** Custom providers (STEPCODE_CONFIG_PATH and config.toml `[providers]`) registration extension, present only when configured. */
+	customProviderExtension: InlineExtension | undefined;
 }
 
 /**
@@ -50,6 +50,6 @@ export function createStepExtensionFactories(deps: StepExtensionFactoryDeps): In
 		createStepCapabilitiesExtensionInline({ telemetry: deps.telemetry }),
 		createStepCronExtension({ telemetry: deps.telemetry }),
 		createStepGoalExtension({ telemetry: deps.telemetry }),
-		...(deps.stepCodeProviderExtension ? [deps.stepCodeProviderExtension] : []),
+		...(deps.customProviderExtension ? [deps.customProviderExtension] : []),
 	];
 }

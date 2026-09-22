@@ -717,11 +717,16 @@ export {
 export { StepStdioHost, type StepStdioHostOptions } from "./step/stdio-host.ts";
 export {
 	applyStepCodeConfigDefaults,
+	createProviderRegistrationsInlineExtension,
 	createStepCodeProviderInlineExtension,
 	decorateStepCodeSettingsManager,
 	hasConfiguredStepCodeCredential,
 	loadStepCodeConfig,
+	providerHasInlineCredential,
+	readStepConfigProviderRegistrations,
 	type StepCodeConfig,
+	type StepCodeProviderRegistration,
+	type StepConfigProviderRegistrations,
 } from "./step/stepcode-config.ts";
 export { buildStepSystemPromptAppendix } from "./step/system-prompt.ts";
 export {

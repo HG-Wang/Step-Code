@@ -399,3 +399,57 @@ describe("Step global defaults", () => {
 		expect(readGlobalStepDefaults(env)).toEqual({ model: "nested" });
 	});
 });
+
+describe("Step config.toml custom-provider persistence", () => {
+	const roots: string[] = [];
+
+	afterEach(() => {
+		for (const root of roots.splice(0)) {
+			if (existsSync(root)) rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps [providers.<id>] (including arrays of tables) across a settings write", () => {
+		const root = join(process.cwd(), `test-toml-providers-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+		mkdirSync(root, { recursive: true });
+		roots.push(root);
+		const configPath = join(root, "config.toml");
+		const providerBlock = {
+			providers: {
+				ollama: {
+					name: "Ollama",
+					api: "openai-completions",
+					baseUrl: "http://localhost:11434/v1",
+					apiKey: "ollama",
+					compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+					models: [
+						{
+							id: "qwen2.5-coder:7b",
+							name: "Qwen2.5 Coder 7B",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 131072,
+							maxTokens: 8192,
+						},
+					],
+				},
+			},
+		};
+		writeStepConfig(configPath, { theme: "step-blue", ...providerBlock });
+
+		// A Pi settings write through Step's TOML storage performs a read-modify-
+		// write over the whole document; custom providers must survive it (both the
+		// unknown-key merge and smol-toml's array-of-table re-serialization).
+		const storage = new StepTomlSettingsStorage(root, process.env, { global: configPath });
+		storage.withLock("global", (current) => {
+			const settings = current ? JSON.parse(current) : {};
+			settings.model = "step-flash";
+			return JSON.stringify(settings);
+		});
+
+		const after = readStepConfig(configPath);
+		expect(after.model).toBe("step-flash");
+		expect(after.providers).toEqual(providerBlock.providers);
+	});
+});

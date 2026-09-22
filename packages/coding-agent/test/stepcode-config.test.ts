@@ -7,9 +7,12 @@ import type { ExtensionAPI, ProviderModelConfig } from "../src/core/extensions/t
 import { createStepSettingsManager } from "../src/step/settings-manager.ts";
 import {
 	applyStepCodeConfigDefaults,
+	createProviderRegistrationsInlineExtension,
 	createStepCodeProviderInlineExtension,
 	decorateStepCodeSettingsManager,
 	loadStepCodeConfig,
+	providerHasInlineCredential,
+	readStepConfigProviderRegistrations,
 } from "../src/step/stepcode-config.ts";
 
 const roots: string[] = [];
@@ -332,7 +335,7 @@ describe("StepCode config anthropic-messages thinking contract", () => {
 		expect(models["step-5-preview"]).toMatchObject({ thinkingLevelMap: { off: "none", medium: "medium" } });
 	});
 
-	test("reads no compat for a non-anthropic wire dialect", async () => {
+	test("ignores Anthropic-only compat flags on an OpenAI-completions dialect", async () => {
 		const models = await loadAnthropicModels([
 			{ id: "step-5-preview", api: "openai-completions", compat: { forceAdaptiveThinking: true } },
 		]);
@@ -368,5 +371,239 @@ describe("StepCode config anthropic-messages thinking contract", () => {
 			},
 		]);
 		expect(models["step-5-preview"]).not.toHaveProperty("compat");
+	});
+});
+
+describe("Step config.toml custom providers", () => {
+	// Point the config root at a temp directory: resolveStepConfigRoot derives the
+	// config.toml parent from STEP_CODING_AGENT_DIR, so `<temp>/agent` -> `<temp>`.
+	function tomlEnv(root: string): Record<string, string | undefined> {
+		return { STEP_CODING_AGENT_DIR: join(root, "agent"), HOME: root, USERPROFILE: root };
+	}
+
+	async function writeToml(root: string, body: string): Promise<void> {
+		await writeFile(join(root, "config.toml"), body, "utf8");
+	}
+
+	test("reads an OpenAI-compatible [providers.<id>] block", async () => {
+		const root = await mkdtemp(join(tmpdir(), "step-toml-providers-"));
+		roots.push(root);
+		await writeToml(
+			root,
+			`[providers.ollama]
+name = "Ollama (local)"
+api = "openai-completions"
+baseUrl = "http://localhost:11434/v1"
+apiKey = "ollama"
+
+[[providers.ollama.models]]
+id = "qwen2.5-coder:7b"
+name = "Qwen2.5 Coder 7B"
+reasoning = false
+contextWindow = 131072
+maxTokens = 8192
+`,
+		);
+
+		const result = readStepConfigProviderRegistrations(tomlEnv(root));
+		expect(result.error).toBeUndefined();
+		expect(result.providers).toHaveLength(1);
+		const provider = result.providers[0]!;
+		expect(provider.id).toBe("ollama");
+		expect(provider.config).toMatchObject({
+			name: "Ollama (local)",
+			api: "openai-completions",
+			baseUrl: "http://localhost:11434/v1",
+			apiKey: "ollama",
+		});
+		expect(provider.config.models?.[0]).toMatchObject({
+			id: "qwen2.5-coder:7b",
+			api: "openai-completions",
+			baseUrl: "http://localhost:11434/v1",
+			reasoning: false,
+			contextWindow: 131072,
+			maxTokens: 8192,
+		});
+	});
+
+	test("accepts the openai-compatible api alias and applies model defaults", async () => {
+		const root = await mkdtemp(join(tmpdir(), "step-toml-alias-"));
+		roots.push(root);
+		await writeToml(
+			root,
+			`[providers.gateway]
+api = "openai-compatible"
+baseUrl = "https://gw.example/v1"
+
+[[providers.gateway.models]]
+id = "m1"
+`,
+		);
+
+		const result = readStepConfigProviderRegistrations(tomlEnv(root));
+		expect(result.error).toBeUndefined();
+		const model = result.providers[0]?.config.models?.[0];
+		expect(result.providers[0]?.config.api).toBe("openai-completions");
+		expect(model).toMatchObject({
+			id: "m1",
+			api: "openai-completions",
+			baseUrl: "https://gw.example/v1",
+			reasoning: true,
+			contextWindow: 128000,
+			maxTokens: 16384,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		});
+	});
+
+	test("does not fall back to STEP_API_KEY when apiKey is omitted", async () => {
+		const root = await mkdtemp(join(tmpdir(), "step-toml-nokey-"));
+		roots.push(root);
+		await writeToml(
+			root,
+			`[providers.local]
+api = "openai-completions"
+baseUrl = "http://localhost:9000/v1"
+
+[[providers.local.models]]
+id = "m1"
+`,
+		);
+
+		const result = readStepConfigProviderRegistrations({ ...tomlEnv(root), STEP_API_KEY: "leaked-step-key" });
+		expect(result.error).toBeUndefined();
+		expect(result.providers[0]?.config.apiKey).toBeUndefined();
+	});
+
+	test("preserves env-interpolation and command apiKey values verbatim", async () => {
+		const root = await mkdtemp(join(tmpdir(), "step-toml-keyforms-"));
+		roots.push(root);
+		await writeToml(
+			root,
+			`[providers.envkey]
+api = "openai-completions"
+baseUrl = "http://localhost:9001/v1"
+apiKey = "$MY_CUSTOM_KEY"
+
+[[providers.envkey.models]]
+id = "m1"
+
+[providers.cmdkey]
+api = "openai-completions"
+baseUrl = "http://localhost:9002/v1"
+apiKey = "!op read op://vault/item/key"
+
+[[providers.cmdkey.models]]
+id = "m2"
+`,
+		);
+
+		const result = readStepConfigProviderRegistrations(tomlEnv(root));
+		const byId = new Map(result.providers.map((provider) => [provider.id, provider.config.apiKey]));
+		expect(byId.get("envkey")).toBe("$MY_CUSTOM_KEY");
+		expect(byId.get("cmdkey")).toBe("!op read op://vault/item/key");
+	});
+
+	test("reads provider- and model-level compat with model overriding provider", async () => {
+		const root = await mkdtemp(join(tmpdir(), "step-toml-compat-"));
+		roots.push(root);
+		await writeToml(
+			root,
+			`[providers.vllm]
+api = "openai-completions"
+baseUrl = "http://localhost:8000/v1"
+compat = { supportsDeveloperRole = false, supportsReasoningEffort = false }
+
+[[providers.vllm.models]]
+id = "m1"
+compat = { supportsDeveloperRole = true, maxTokensField = "max_tokens" }
+`,
+		);
+
+		const result = readStepConfigProviderRegistrations(tomlEnv(root));
+		expect(result.providers[0]?.config.models?.[0]?.compat).toMatchObject({
+			supportsDeveloperRole: true,
+			supportsReasoningEffort: false,
+			maxTokensField: "max_tokens",
+		});
+	});
+
+	test("skips unusable providers and reports an error", async () => {
+		const root = await mkdtemp(join(tmpdir(), "step-toml-skip-"));
+		roots.push(root);
+		await writeToml(
+			root,
+			`[providers.good]
+api = "openai-completions"
+baseUrl = "http://localhost:7000/v1"
+
+[[providers.good.models]]
+id = "ok"
+
+[providers.bad]
+api = "openai-completions"
+
+[[providers.bad.models]]
+id = "x"
+`,
+		);
+
+		const result = readStepConfigProviderRegistrations(tomlEnv(root));
+		expect(result.providers.map((provider) => provider.id)).toEqual(["good"]);
+		expect(result.error).toContain("bad");
+		expect(result.error).toContain("baseUrl");
+	});
+
+	test("returns nothing for a missing or provider-free config", async () => {
+		const root = await mkdtemp(join(tmpdir(), "step-toml-missing-"));
+		roots.push(root);
+		const missing = readStepConfigProviderRegistrations(tomlEnv(root));
+		expect(missing).toEqual({ providers: [] });
+
+		await writeToml(root, `# just a comment\ntheme = "step-blue"\n`);
+		const noProviders = readStepConfigProviderRegistrations(tomlEnv(root));
+		expect(noProviders).toEqual({ providers: [] });
+	});
+
+	test("createProviderRegistrationsInlineExtension registers every provider", async () => {
+		const root = await mkdtemp(join(tmpdir(), "step-toml-ext-"));
+		roots.push(root);
+		await writeToml(
+			root,
+			`[providers.a]
+api = "openai-completions"
+baseUrl = "http://localhost:7001/v1"
+
+[[providers.a.models]]
+id = "m1"
+
+[providers.b]
+api = "openai-completions"
+baseUrl = "http://localhost:7002/v1"
+
+[[providers.b.models]]
+id = "m2"
+`,
+		);
+		const { providers } = readStepConfigProviderRegistrations(tomlEnv(root));
+		const registered: Array<{ id: string; api: unknown }> = [];
+		const pi = {
+			registerProvider: (id: string, config: { api?: unknown }) => registered.push({ id, api: config.api }),
+		};
+		const extension = createProviderRegistrationsInlineExtension(providers, "test");
+		if (typeof extension === "function") throw new Error("expected an object-shaped inline extension");
+		extension.factory(pi as unknown as ExtensionAPI);
+		expect(registered).toEqual([
+			{ id: "a", api: "openai-completions" },
+			{ id: "b", api: "openai-completions" },
+		]);
+	});
+
+	test("providerHasInlineCredential resolves env and command references", () => {
+		expect(providerHasInlineCredential({ apiKey: "sk-literal" }, {})).toBe(true);
+		expect(providerHasInlineCredential({ apiKey: "$MY_KEY" }, { MY_KEY: "resolved" })).toBe(true);
+		expect(providerHasInlineCredential({ apiKey: "$MY_KEY" }, {})).toBe(false);
+		expect(providerHasInlineCredential({ apiKey: "!op read x" }, {})).toBe(true);
+		expect(providerHasInlineCredential({}, {})).toBe(false);
 	});
 });

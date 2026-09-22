@@ -72,6 +72,23 @@ step --help
 
 `/status` 查看当前会话和模型状态。使用 `step login status`（或 `step login status --json`）检查 Step 凭据及其有效性。凭据保存在 `~/.stepcode/auth.json`（权限 `0600`）；`/logout` 清除 Step 凭据。登录后，`/model` 会列出当前 Step endpoint 返回的可用模型。
 
+### 自定义 OpenAI 兼容供应商
+
+你也可以在 `~/.stepcode/config.toml` 中添加 `[providers.<id>]` 表来接入自定义的 OpenAI 兼容端点（Ollama、vLLM、one-api、LiteLLM，或任何兼容 OpenAI Chat Completions / Responses API 的代理）。它们会与 Step provider 一起出现在 `/model` 中，并可设为默认：
+
+```toml
+[providers.ollama]
+api     = "openai-completions"
+baseUrl = "http://localhost:11434/v1"
+apiKey  = "ollama"
+compat  = { supportsDeveloperRole = false, supportsReasoningEffort = false }
+
+[[providers.ollama.models]]
+id = "qwen2.5-coder:7b"
+```
+
+完整 schema 与取值规则见 [Step 配置文件](docs/step-configuration.md#custom-model-providers)。
+
 ## 上手
 
 进入要处理的项目目录：

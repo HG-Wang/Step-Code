@@ -8,6 +8,7 @@ import lockfile from "proper-lockfile";
 import type { ExtensionAPI, InlineExtension, ProviderConfig, ProviderModelConfig } from "../core/extensions/types.ts";
 import { normalizeProviderBaseUrl } from "../core/provider-base-url.ts";
 import { stripBom } from "../utils/text.ts";
+import { readStepConfig, resolveStepConfigPath } from "./config-toml.ts";
 import {
 	getStepPermissionPreset,
 	normalizeStepPermissionMode,
@@ -21,6 +22,8 @@ export const STEPCODE_CONFIG_ENV_NAME = "STEPCODE_CONFIG_PATH";
 
 const DEFAULT_PROVIDER_ID = "stepcode";
 const DEFAULT_API_KEY_ENV = "STEP_API_KEY";
+/** Env-reference used as the apiKey fallback for the injected StepCode config only. */
+const DEFAULT_API_KEY_REF = `$${DEFAULT_API_KEY_ENV}`;
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 16_384;
 const STEP_MAX_CONTEXT_TOKENS_ENV = "STEP_MAX_CONTEXT_TOKENS";
@@ -74,7 +77,7 @@ export async function loadStepCodeConfig(
 		contextWindow: readPositiveNumber(env[STEP_MAX_CONTEXT_TOKENS_ENV]),
 		maxTokens: readPositiveNumber(env[STEP_MAX_OUTPUT_TOKENS_ENV]),
 	};
-	const providers = readProviders(root.providers, sharedBaseUrl, sharedApiKey, limits);
+	const providers = readProviders(root.providers, sharedBaseUrl, sharedApiKey, limits, DEFAULT_API_KEY_REF);
 	const registrations =
 		providers.length > 0 ? providers : readLegacyProvider(root, sharedBaseUrl, sharedApiKey, limits);
 	if (registrations.length === 0) {
@@ -99,6 +102,19 @@ export async function loadStepCodeConfig(
 	};
 }
 
+/** Return whether a provider's configured `apiKey` resolves without a login round-trip. */
+export function providerHasInlineCredential(
+	config: ProviderConfig,
+	env: Record<string, string | undefined> = process.env,
+): boolean {
+	const value = config.apiKey?.trim();
+	if (!value) return false;
+	if (value.startsWith("$") && readString(env[value.slice(1)])) return true;
+	if (value.startsWith("!")) return true;
+	if (!value.startsWith("$")) return true;
+	return false;
+}
+
 /** Return whether the external config can provide credentials without login UI. */
 export function hasConfiguredStepCodeCredential(
 	config: StepCodeConfig | undefined,
@@ -106,11 +122,7 @@ export function hasConfiguredStepCodeCredential(
 ): boolean {
 	if (readString(env.STEP_API_KEY)) return true;
 	for (const provider of config?.providers ?? []) {
-		const value = provider.config.apiKey?.trim();
-		if (!value) continue;
-		if (value.startsWith("$") && readString(env[value.slice(1)])) return true;
-		if (value.startsWith("!")) return true;
-		if (!value.startsWith("$")) return true;
+		if (providerHasInlineCredential(provider.config, env)) return true;
 	}
 	return false;
 }
@@ -436,13 +448,72 @@ function findRawActiveModel(root: JsonObject): { providerId: string; modelId: st
 
 /** Register every provider from a loaded StepCode config with Pi. */
 export function createStepCodeProviderInlineExtension(config: StepCodeConfig): InlineExtension {
+	return createProviderRegistrationsInlineExtension(config.providers, `StepCode config (${basename(config.path)})`);
+}
+
+/** Build a hidden inline extension that registers the given provider registrations. */
+export function createProviderRegistrationsInlineExtension(
+	registrations: readonly StepCodeProviderRegistration[],
+	name: string,
+): InlineExtension {
 	return {
-		name: `StepCode config (${basename(config.path)})`,
+		name,
 		hidden: true,
 		factory: (pi: ExtensionAPI): void => {
-			for (const provider of config.providers) pi.registerProvider(provider.id, provider.config);
+			for (const provider of registrations) pi.registerProvider(provider.id, provider.config);
 		},
 	};
+}
+
+export interface StepConfigProviderRegistrations {
+	readonly providers: readonly StepCodeProviderRegistration[];
+	/** Non-fatal problem reading/normalizing the config (a missing or empty block yields none). */
+	readonly error?: string;
+}
+
+/**
+ * Read custom providers declared under `[providers.<id>]` in the global
+ * `config.toml`.
+ *
+ * Unlike the injected `STEPCODE_CONFIG_PATH` config, these are self-contained:
+ * no shared `STEP_BASE_URL`/`STEP_API_KEY`, no env token limits, and no apiKey
+ * env fallback — an omitted `apiKey` stays unset so authentication flows through
+ * `/login`. Invalid or unusable entries are skipped and reported via `error`
+ * rather than aborting startup.
+ */
+export function readStepConfigProviderRegistrations(
+	env: Record<string, string | undefined> = process.env,
+): StepConfigProviderRegistrations {
+	const path = resolveStepConfigPath(env);
+	let document: ReturnType<typeof readStepConfig>;
+	try {
+		document = readStepConfig(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { providers: [] };
+		return {
+			providers: [],
+			error: `Could not read Step config providers from ${path}: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+
+	const rawProviders = document.providers;
+	if (rawProviders === undefined) return { providers: [] };
+	if (typeof rawProviders !== "object" || rawProviders === null || Array.isArray(rawProviders)) {
+		return { providers: [], error: `Invalid [providers] in ${path}: expected a table of providers keyed by id.` };
+	}
+
+	const declaredIds = Object.entries(rawProviders as Record<string, unknown>)
+		.filter(([, raw]) => asObject(raw) !== undefined)
+		.map(([id]) => id);
+	const registrations = readProviders(rawProviders, undefined, undefined, {}, undefined);
+	if (registrations.length < declaredIds.length) {
+		const skipped = declaredIds.filter((id) => !registrations.some((registration) => registration.id === id));
+		return {
+			providers: registrations,
+			error: `Skipped unusable provider(s) in ${path} (${skipped.join(", ")}): each [providers.<id>] needs a valid "api" and "baseUrl" and at least one model.`,
+		};
+	}
+	return { providers: registrations };
 }
 
 /** Make an external active model behave like an explicit StepCode selection. */
@@ -473,6 +544,7 @@ function readProviders(
 	sharedBaseUrl: string | undefined,
 	sharedApiKey: string | undefined,
 	limits: StepCodeTokenLimits,
+	defaultApiKey: string | undefined,
 ): StepCodeProviderRegistration[] {
 	const providers = asObject(value);
 	if (!providers) return [];
@@ -481,7 +553,7 @@ function readProviders(
 	for (const [id, rawProvider] of Object.entries(providers)) {
 		const provider = asObject(rawProvider);
 		if (!provider) continue;
-		const registration = normalizeProvider(id, provider, sharedBaseUrl, sharedApiKey, limits);
+		const registration = normalizeProvider(id, provider, sharedBaseUrl, sharedApiKey, limits, defaultApiKey);
 		if (registration) result.push(registration);
 	}
 	return result;
@@ -508,7 +580,14 @@ function readLegacyProvider(
 		apiKey: sharedApiKey ?? `$${DEFAULT_API_KEY_ENV}`,
 		models: [{ id: model, model, api }],
 	};
-	const registration = normalizeProvider(providerId, provider, sharedBaseUrl, sharedApiKey, limits);
+	const registration = normalizeProvider(
+		providerId,
+		provider,
+		sharedBaseUrl,
+		sharedApiKey,
+		limits,
+		DEFAULT_API_KEY_REF,
+	);
 	return registration ? [registration] : [];
 }
 
@@ -518,6 +597,7 @@ function normalizeProvider(
 	sharedBaseUrl: string | undefined,
 	sharedApiKey: string | undefined,
 	limits: StepCodeTokenLimits,
+	defaultApiKey: string | undefined,
 ): StepCodeProviderRegistration | undefined {
 	const models = Array.isArray(provider.models)
 		? provider.models
@@ -528,18 +608,33 @@ function normalizeProvider(
 	if (!providerApi || models.length === 0) return undefined;
 	const baseUrl = normalizeBaseUrl(sharedBaseUrl ?? readString(provider.baseUrl), providerApi);
 	if (!baseUrl) return undefined;
-	const apiKey = readString(provider.apiKey) ?? sharedApiKey ?? `$${DEFAULT_API_KEY_ENV}`;
+	const apiKey = readString(provider.apiKey) ?? sharedApiKey ?? defaultApiKey;
+	// Provider-level compat defaults for every model under this provider; a model's
+	// own compat block overrides it per key. OpenAI dialects historically ignored
+	// compat here, so this is read for every dialect now.
+	const providerCompat = readCompat(provider.compat, providerApi);
 	const config: ProviderConfig = {
 		name: readString(provider.name) ?? providerId,
 		api: providerApi,
 		baseUrl,
 		apiKey,
 		authHeader: readBoolean(provider.authHeader),
-		models: models.map((model) => ({
-			...model,
-			api: model.api ?? providerApi,
-			baseUrl: normalizeBaseUrl(model.baseUrl ?? baseUrl, model.api ?? providerApi),
-		})),
+		models: models.map((model) => {
+			// Model-level compat overrides provider-level per key (shallow merge is
+			// enough: every flag is a scalar, nested records are replaced wholesale).
+			const compat = providerCompat
+				? ({
+						...(providerCompat as Record<string, unknown>),
+						...(model.compat as Record<string, unknown> | undefined),
+					} as unknown as ProviderModelConfig["compat"])
+				: model.compat;
+			return {
+				...model,
+				api: model.api ?? providerApi,
+				baseUrl: normalizeBaseUrl(model.baseUrl ?? baseUrl, model.api ?? providerApi),
+				...(compat ? { compat } : {}),
+			};
+		}),
 	};
 	const headers = readStringRecord(provider.headers);
 	if (headers) config.headers = headers;
@@ -578,7 +673,7 @@ function normalizeModel(
 	// entry that needs adaptive thinking must state `compat.forceAdaptiveThinking`
 	// and `thinkingLevelMap` itself — there is no built-in catalog to inherit from.
 	const effectiveThinkingLevelMap = readThinkingLevelMap(model.thinkingLevelMap);
-	const compat = api === "anthropic-messages" ? readAnthropicCompat(model.compat) : undefined;
+	const compat = readCompat(model.compat, api);
 	return {
 		id: wireModel,
 		name,
@@ -749,7 +844,7 @@ function readThinkingLevelMap(value: unknown): ProviderModelConfig["thinkingLeve
  * `allowedFallbackModels` is intentionally absent: it is a typed list rather than
  * a flag, and a non-empty value makes the adapter request the server-side
  * fallback beta, which is not something an injected config should switch on
- * implicitly. Nothing reads `compat` for the OpenAI dialects.
+ * implicitly. The OpenAI dialects read their own `compat` flags below.
  */
 const ANTHROPIC_COMPAT_FLAGS = [
 	"supportsEagerToolInputStreaming",
@@ -772,6 +867,126 @@ function readAnthropicCompat(value: unknown): AnthropicMessagesCompat | undefine
 		if (declared !== undefined) compat[flag] = declared;
 	}
 	return Object.keys(compat).length > 0 ? compat : undefined;
+}
+
+// —— OpenAI-compatible compat flags ——
+//
+// `compat` used to be read only for the Anthropic dialect. Custom OpenAI-
+// compatible servers (Ollama, vLLM, SGLang, one-api, LiteLLM, ...) routinely
+// need to opt out of fields pi sends by default, so these are now read for the
+// OpenAI dialects too, at provider and model level (model wins per key).
+
+const OPENAI_COMPLETIONS_BOOL_FLAGS = [
+	"supportsStore",
+	"supportsDeveloperRole",
+	"supportsReasoningEffort",
+	"supportsUsageInStreaming",
+	"supportsFinishReason",
+	"requiresToolResultName",
+	"requiresAssistantAfterToolResult",
+	"requiresThinkingAsText",
+	"requiresReasoningContentOnAssistantMessages",
+	"supportsOpenAIGrammarTools",
+	"supportsStrictMode",
+	"sendSessionAffinityHeaders",
+	"supportsLongCacheRetention",
+	"zaiToolStream",
+	"supportsThinkingTokenBudget",
+] as const;
+
+const OPENAI_RESPONSES_BOOL_FLAGS = [
+	"supportsDeveloperRole",
+	"supportsLongCacheRetention",
+	"supportsStrictMode",
+	"supportsOpenAIGrammarTools",
+	"supportsAdditionalTools",
+	"supportsToolSearch",
+	"supportsExplicitPromptCacheMode",
+] as const;
+
+const MAX_TOKENS_FIELD_VALUES = ["max_completion_tokens", "max_tokens"] as const;
+const THINKING_FORMAT_VALUES = [
+	"openai",
+	"openrouter",
+	"deepseek",
+	"together",
+	"baseten",
+	"zai",
+	"qwen",
+	"chat-template",
+	"qwen-chat-template",
+	"string-thinking",
+	"ant-ling",
+] as const;
+const SESSION_AFFINITY_FORMAT_VALUES = ["openai", "openai-nosession", "openrouter"] as const;
+const CACHE_CONTROL_FORMAT_VALUES = ["anthropic"] as const;
+const DEFERRED_TOOLS_MODE_VALUES = ["kimi"] as const;
+const THINKING_TOKEN_BUDGET_FIELD_VALUES = [
+	"thinking_token_budget",
+	"thinking_budget",
+	"thinking_budget_tokens",
+] as const;
+
+function readEnumField<T extends string>(raw: JsonObject, key: string, allowed: readonly T[]): T | undefined {
+	const value = readString(raw[key]);
+	return value !== undefined && (allowed as readonly string[]).includes(value) ? (value as T) : undefined;
+}
+
+function collectCompat(
+	raw: JsonObject,
+	boolFlags: readonly string[],
+	nestedKeys: readonly string[],
+): Record<string, unknown> {
+	const compat: Record<string, unknown> = {};
+	for (const flag of boolFlags) {
+		const declared = readBoolean(raw[flag]);
+		if (declared !== undefined) compat[flag] = declared;
+	}
+	const maxTokensField = readEnumField(raw, "maxTokensField", MAX_TOKENS_FIELD_VALUES);
+	if (maxTokensField) compat.maxTokensField = maxTokensField;
+	const thinkingFormat = readEnumField(raw, "thinkingFormat", THINKING_FORMAT_VALUES);
+	if (thinkingFormat) compat.thinkingFormat = thinkingFormat;
+	const sessionAffinityFormat = readEnumField(raw, "sessionAffinityFormat", SESSION_AFFINITY_FORMAT_VALUES);
+	if (sessionAffinityFormat) compat.sessionAffinityFormat = sessionAffinityFormat;
+	const cacheControlFormat = readEnumField(raw, "cacheControlFormat", CACHE_CONTROL_FORMAT_VALUES);
+	if (cacheControlFormat) compat.cacheControlFormat = cacheControlFormat;
+	const deferredToolsMode = readEnumField(raw, "deferredToolsMode", DEFERRED_TOOLS_MODE_VALUES);
+	if (deferredToolsMode) compat.deferredToolsMode = deferredToolsMode;
+	const thinkingTokenBudgetField = readEnumField(raw, "thinkingTokenBudgetField", THINKING_TOKEN_BUDGET_FIELD_VALUES);
+	if (thinkingTokenBudgetField) compat.thinkingTokenBudgetField = thinkingTokenBudgetField;
+	for (const key of nestedKeys) {
+		const record = asObject(raw[key]);
+		if (record) compat[key] = record;
+	}
+	return compat;
+}
+
+const OPENAI_COMPLETIONS_NESTED_RECORDS = [
+	"openRouterRouting",
+	"vercelGatewayRouting",
+	"chatTemplateKwargs",
+	"chatTemplateArgs",
+] as const;
+const OPENAI_RESPONSES_NESTED_RECORDS = ["vercelGatewayRouting"] as const;
+
+/** Read a model/provider `compat` block for the given dialect. */
+function readCompat(value: unknown, api: Api): ProviderModelConfig["compat"] | undefined {
+	const raw = asObject(value);
+	if (!raw) return undefined;
+	let compat: Record<string, unknown> | undefined;
+	switch (api) {
+		case "anthropic-messages":
+			return readAnthropicCompat(value);
+		case "openai-completions":
+			compat = collectCompat(raw, OPENAI_COMPLETIONS_BOOL_FLAGS, OPENAI_COMPLETIONS_NESTED_RECORDS);
+			break;
+		case "openai-responses":
+			compat = collectCompat(raw, OPENAI_RESPONSES_BOOL_FLAGS, OPENAI_RESPONSES_NESTED_RECORDS);
+			break;
+		default:
+			return undefined;
+	}
+	return Object.keys(compat).length > 0 ? (compat as unknown as ProviderModelConfig["compat"]) : undefined;
 }
 
 function firstSupportedApi(value: unknown): string | undefined {

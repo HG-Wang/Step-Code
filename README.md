@@ -72,6 +72,23 @@ Inside the TUI, `/login` opens the Step sign-in flow; from a shell, run `step lo
 
 `/status` shows the current session and model status. Use `step login status` (or `step login status --json`) to check the Step credential and its validity. Stored credentials live in `~/.stepcode/auth.json` with mode `0600`; `/logout` clears the Step credential. After sign-in, `/model` lists the models discovered from the active Step endpoint.
 
+### Custom OpenAI-compatible providers
+
+You can also add custom OpenAI-compatible endpoints (Ollama, vLLM, one-api, LiteLLM, or any proxy that speaks the OpenAI Chat Completions or Responses API) by adding a `[providers.<id>]` table to `~/.stepcode/config.toml`. They appear in `/model` next to the Step provider and can be made the default:
+
+```toml
+[providers.ollama]
+api     = "openai-completions"
+baseUrl = "http://localhost:11434/v1"
+apiKey  = "ollama"
+compat  = { supportsDeveloperRole = false, supportsReasoningEffort = false }
+
+[[providers.ollama.models]]
+id = "qwen2.5-coder:7b"
+```
+
+See [Step configuration files](docs/step-configuration.md#custom-model-providers) for the full schema and value-resolution rules.
+
 ## Getting started
 
 Change into your project directory:
